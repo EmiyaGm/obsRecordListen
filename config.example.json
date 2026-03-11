@@ -1,0 +1,36 @@
+{
+  "obs": {
+    "host": "127.0.0.1",
+    "port": 4455,
+    "password": "your_obs_websocket_password",
+    "timeout_seconds": 3
+  },
+  "bark": {
+    "server": "https://api.day.app",
+    "targets": [
+      {
+        "device_key": "your_device_key_1",
+        "code": "your_code_1"
+      },
+      {
+        "device_key": "your_device_key_2",
+        "code": "your_code_2"
+      }
+    ],
+    "group": "OBS Watchdog",
+    "sound": "bell"
+  },
+  "monitor": {
+    "check_interval_seconds": 5,
+    "alert_cooldown_seconds": 60,
+    "expect_recording": true,
+    "expect_streaming": false,
+    "detect_stall": true,
+    "stall_source_name": "Program",
+    "stall_image_width": 640,
+    "stall_image_height": 360,
+    "stall_image_quality": 70,
+    "stall_seconds": 90,
+    "stall_only_when_output_active": true
+  }
+}
