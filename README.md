@@ -26,12 +26,26 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
+Windows (PowerShell):
+
+```powershell
+py -m venv .venv
+.venv\Scripts\Activate.ps1
+pip install -r requirements.txt
+```
+
 ## 3) Configure
 
 Copy config template:
 
 ```bash
 cp config.example.json config.json
+```
+
+Windows (PowerShell):
+
+```powershell
+Copy-Item config.example.json config.json
 ```
 
 Then edit `config.json`.
@@ -50,6 +64,12 @@ Important fields:
 
 ```bash
 python monitor_obs.py --config config.json
+```
+
+Windows (PowerShell):
+
+```powershell
+py monitor_obs.py --config config.json
 ```
 
 Keep this process running in background (tmux/systemd/launchd are recommended).
