@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from typing import Optional
 
 import requests
-from websocket import WebSocket, create_connection
+from websocket import WebSocket, WebSocketTimeoutException, create_connection
 
 
 class ObsRequestError(Exception):
@@ -128,8 +128,9 @@ class ObsWatchdog:
 
             identify = {
                 "rpcVersion": 1,
-                # Subscribe to all events, including high-volume meter events.
-                "eventSubscriptions": 0xFFFFFFFF,
+                # Subscribe to all normal events + InputVolumeMeters high-volume event.
+                # 2047 = General..Ui, 65536 = InputVolumeMeters
+                "eventSubscriptions": 2047 | 65536,
             }
             auth_info = (hello.get("d") or {}).get("authentication")
             if auth_info:
@@ -166,6 +167,24 @@ class ObsWatchdog:
                 "无法连接到 OBS WebSocket。",
             )
             return False
+
+    def _pump_events(self, max_wait_ms: int = 120) -> None:
+        if self.client is None:
+            return
+        end_at = time.time() + max_wait_ms / 1000.0
+        old_timeout = self.client.gettimeout()
+        try:
+            self.client.settimeout(0.02)
+            while time.time() < end_at:
+                try:
+                    raw = self.client.recv()
+                except WebSocketTimeoutException:
+                    continue
+                msg = json.loads(raw)
+                if msg.get("op") == 5:
+                    self._handle_event(msg)
+        finally:
+            self.client.settimeout(old_timeout)
 
     def _flatten_numbers(self, value: object) -> list[float]:
         values: list[float] = []
@@ -274,6 +293,7 @@ class ObsWatchdog:
             return None
         try:
             now = time.time()
+            self._pump_events()
             # Prefer realtime meter data when available.
             freshness_window = max(1, self.monitor_cfg.check_interval_seconds * 2)
             if self.last_meter_db is not None and now - self.last_meter_ts <= freshness_window:
