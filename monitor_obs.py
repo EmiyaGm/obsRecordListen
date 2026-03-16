@@ -56,6 +56,8 @@ class MonitorConfig:
     silence_only_when_output_active: bool
     log_audio_volume: bool
     log_audio_volume_interval_seconds: int
+    meter_timeout_seconds: int
+    startup_grace_seconds: int
 
 
 class BarkNotifier:
@@ -94,12 +96,26 @@ class ObsWatchdog:
 
         self.client: Optional[WebSocket] = None
         self.request_id = 0
+
         self.last_sound_active_ts: Optional[float] = None
         self.last_alert_ts_by_key: dict[str, float] = {}
         self.silence_alert_active = False
+        self.meter_missing_alert_active = False
+
         self.last_audio_log_ts: float = 0.0
         self.last_meter_db: Optional[float] = None
         self.last_meter_ts: float = 0.0
+        self.connected_ts: float = 0.0
+        self.meter_parse_warned = False
+        self.meter_name_hint_warned = False
+
+    def _reset_runtime_audio_state(self) -> None:
+        self.last_sound_active_ts = None
+        self.silence_alert_active = False
+        self.meter_missing_alert_active = False
+        self.last_meter_db = None
+        self.last_meter_ts = 0.0
+        self.last_audio_log_ts = 0.0
 
     def _can_alert(self, key: str, now: float) -> bool:
         last = self.last_alert_ts_by_key.get(key, 0.0)
@@ -113,6 +129,16 @@ class ObsWatchdog:
         if self._can_alert(key, now):
             print(f"[ALERT] {title} - {body}")
             self.notifier.send(title, body)
+
+    def _disconnect_client(self) -> None:
+        try:
+            if self.client is not None:
+                self.client.close()
+        except Exception:
+            pass
+        self.client = None
+        self.connected_ts = 0.0
+        self._reset_runtime_audio_state()
 
     def _connect(self) -> bool:
         if self.client is not None:
@@ -128,8 +154,6 @@ class ObsWatchdog:
 
             identify = {
                 "rpcVersion": 1,
-                # Subscribe to all normal events + InputVolumeMeters high-volume event.
-                # 2047 = General..Ui, 65536 = InputVolumeMeters
                 "eventSubscriptions": 2047 | 65536,
             }
             auth_info = (hello.get("d") or {}).get("authentication")
@@ -151,15 +175,12 @@ class ObsWatchdog:
                 raise RuntimeError(f"OBS 身份认证失败: {identified}")
 
             self.client = ws
+            self.connected_ts = time.time()
+            self._reset_runtime_audio_state()
             print("[INFO] 已连接 OBS WebSocket。")
             return True
         except Exception as exc:
-            try:
-                if self.client is not None:
-                    self.client.close()
-            except Exception:
-                pass
-            self.client = None
+            self._disconnect_client()
             print(f"[WARN] OBS 连接失败: {exc}")
             self._alert(
                 "obs_disconnected",
@@ -191,6 +212,10 @@ class ObsWatchdog:
         if isinstance(value, (int, float)):
             values.append(float(value))
             return values
+        if isinstance(value, dict):
+            for item in value.values():
+                values.extend(self._flatten_numbers(item))
+            return values
         if isinstance(value, list):
             for item in value:
                 values.extend(self._flatten_numbers(item))
@@ -201,19 +226,41 @@ class ObsWatchdog:
         if data.get("eventType") != "InputVolumeMeters":
             return
         event_data = data.get("eventData") or {}
+        seen_names: list[str] = []
         for item in event_data.get("inputs", []):
             input_name = item.get("inputName")
+            if isinstance(input_name, str) and input_name:
+                seen_names.append(input_name)
             if input_name != self.monitor_cfg.audio_input_name:
                 continue
+
             db_values = self._flatten_numbers(item.get("inputLevelsDb"))
             if not db_values:
+                mul_values = self._flatten_numbers(item.get("inputLevelsMul"))
+                db_values = [20.0 * math.log10(max(v, 1e-6)) if v > 0 else -120.0 for v in mul_values]
+            if not db_values:
+                if not self.meter_parse_warned:
+                    print(
+                        "[WARN] 已收到目标输入的实时电平事件，但字段解析为空。"
+                        f"可见字段: {list(item.keys())}"
+                    )
+                    self.meter_parse_warned = True
                 continue
-            # OBS meter may include -inf when silent; choose the highest finite value.
+
             finite_values = [v for v in db_values if math.isfinite(v)]
             current_db = max(finite_values) if finite_values else -120.0
+
             self.last_meter_db = current_db
             self.last_meter_ts = time.time()
             break
+        else:
+            if seen_names and not self.meter_name_hint_warned:
+                preview = ", ".join(seen_names[:8])
+                print(
+                    "[WARN] 已收到实时电平事件，但未匹配到配置的 audio_input_name。"
+                    f"事件中的输入名示例: {preview}"
+                )
+                self.meter_name_hint_warned = True
 
     def _obs_request(self, request_type: str, request_data: Optional[dict] = None) -> dict:
         if self.client is None:
@@ -231,7 +278,6 @@ class ObsWatchdog:
         }
         self.client.send(json.dumps(payload))
 
-        # Ignore events/other messages until request response arrives.
         while True:
             raw = self.client.recv()
             msg = json.loads(raw)
@@ -276,11 +322,7 @@ class ObsWatchdog:
             return bool(rec.get("outputActive")), bool(stream.get("outputActive"))
         except Exception as exc:
             print(f"[WARN] 读取 OBS 状态失败: {exc}")
-            try:
-                self.client.close()
-            except Exception:
-                pass
-            self.client = None
+            self._disconnect_client()
             self._alert(
                 "obs_disconnected",
                 "OBS 状态不可用",
@@ -291,61 +333,31 @@ class ObsWatchdog:
     def _get_input_volume_db(self) -> Optional[float]:
         if self.client is None:
             return None
-        try:
-            now = time.time()
-            self._pump_events()
-            # Prefer realtime meter data when available.
-            freshness_window = max(1, self.monitor_cfg.check_interval_seconds * 2)
-            if self.last_meter_db is not None and now - self.last_meter_ts <= freshness_window:
-                return self.last_meter_db
 
-            resp = self._obs_request(
-                "GetInputVolume",
-                {
-                    "inputName": self.monitor_cfg.audio_input_name,
-                }
-            )
-            volume_db = resp.get("inputVolumeDb")
-            if volume_db is None:
-                print("[WARN] OBS 未返回 inputVolumeDb，跳过本次声音检测。")
-                return None
-            print(
-                "[WARN] 当前使用输入增益值而非实时电平，"
-                "请确认 OBS 版本支持 InputVolumeMeters 事件。"
-            )
-            return float(volume_db)
-        except ObsRequestError as exc:
-            # Input name is invalid: this is config issue, not websocket disconnection.
-            if exc.request_type == "GetInputVolume" and "No input was found" in exc.comment:
-                print(
-                    f"[WARN] 音频输入不存在: {self.monitor_cfg.audio_input_name}，已停用静音检测。"
-                )
-                self.monitor_cfg.detect_audio_silence = False
-                self._alert(
-                    "audio_input_missing",
-                    "音频输入不存在",
-                    (
-                        f"OBS 中未找到音频输入 '{self.monitor_cfg.audio_input_name}'，"
-                        "已自动停用静音检测。请修改 config.json 的 audio_input_name。"
-                    ),
-                )
-                return None
-            print(f"[WARN] OBS 音量请求失败: {exc}")
+        now = time.time()
+        self._pump_events()
+
+        if now - self.connected_ts < self.monitor_cfg.startup_grace_seconds:
             return None
-        except Exception as exc:
-            print(f"[WARN] OBS 读取音量失败: {exc}")
-            try:
-                if self.client is not None:
-                    self.client.close()
-            except Exception:
-                pass
-            self.client = None
+
+        if self.last_meter_db is not None and now - self.last_meter_ts <= self.monitor_cfg.meter_timeout_seconds:
+            if self.meter_missing_alert_active:
+                print("[INFO] 已重新收到音频电平事件。")
+                self.meter_missing_alert_active = False
+            return self.last_meter_db
+
+        if not self.meter_missing_alert_active:
             self._alert(
-                "audio_volume_failed",
-                "OBS 音量读取失败",
-                "无法读取音频输入音量，无法进行静音检测。",
+                "audio_meter_missing",
+                "OBS 音频电平不可用",
+                (
+                    f"音频输入 '{self.monitor_cfg.audio_input_name}' 的实时电平事件"
+                    f"已超过 {self.monitor_cfg.meter_timeout_seconds} 秒未更新。"
+                ),
             )
-            return None
+            self.meter_missing_alert_active = True
+
+        return None
 
     def _check_audio_silence(self, recording_active: bool, streaming_active: bool) -> None:
         if not self.monitor_cfg.detect_audio_silence:
@@ -354,15 +366,20 @@ class ObsWatchdog:
         should_check = True
         if self.monitor_cfg.silence_only_when_output_active:
             should_check = recording_active or streaming_active
+
         if not should_check:
             self.last_sound_active_ts = None
             self.silence_alert_active = False
+            self.meter_missing_alert_active = False
             return
 
         now = time.time()
         volume_db = self._get_input_volume_db()
+
         if volume_db is None:
+            self._maybe_log_audio_volume(None, now)
             return
+
         self._maybe_log_audio_volume(volume_db, now)
 
         if volume_db > self.monitor_cfg.silence_threshold_db:
@@ -389,12 +406,27 @@ class ObsWatchdog:
             )
             self.silence_alert_active = True
 
-    def _maybe_log_audio_volume(self, volume_db: float, now: float) -> None:
+    def _maybe_log_audio_volume(self, volume_db: Optional[float], now: float) -> None:
         if not self.monitor_cfg.log_audio_volume:
             return
         interval = max(0, self.monitor_cfg.log_audio_volume_interval_seconds)
         if interval > 0 and now - self.last_audio_log_ts < interval:
             return
+
+        if volume_db is None:
+            # Skip "unknown" log during startup grace period to avoid one-time false alarm.
+            if now - self.connected_ts < self.monitor_cfg.startup_grace_seconds:
+                return
+            self.last_audio_log_ts = now
+            print(
+                "[AUDIO] "
+                f"输入='{self.monitor_cfg.audio_input_name}' "
+                "音量=无实时数据 "
+                f"阈值={self.monitor_cfg.silence_threshold_db:.1f} dB "
+                "状态=未知"
+            )
+            return
+
         self.last_audio_log_ts = now
         status = "有声" if volume_db > self.monitor_cfg.silence_threshold_db else "静音区间"
         print(
@@ -417,6 +449,7 @@ class ObsWatchdog:
                         "OBS 录制已停止",
                         "当前未检测到录制进行中。",
                     )
+
                 if self.monitor_cfg.expect_streaming and not streaming_active:
                     self._alert(
                         "stream_stopped",
@@ -444,7 +477,6 @@ def load_config(path: str) -> tuple[ObsConfig, BarkConfig, MonitorConfig]:
         if device_key and code:
             targets.append(BarkTarget(device_key=device_key, code=code))
 
-    # Backward compatibility: old config may provide separate arrays/fields.
     if not targets:
         codes = bark_raw.get("codes", []) or []
         device_keys = bark_raw.get("device_keys", []) or []
@@ -466,6 +498,7 @@ def load_config(path: str) -> tuple[ObsConfig, BarkConfig, MonitorConfig]:
         group=bark_raw.get("group", "OBS Watchdog"),
         sound=bark_raw.get("sound", "bell"),
     )
+
     monitor_raw = raw["monitor"]
     monitor_cfg = MonitorConfig(
         check_interval_seconds=int(monitor_raw["check_interval_seconds"]),
@@ -479,7 +512,9 @@ def load_config(path: str) -> tuple[ObsConfig, BarkConfig, MonitorConfig]:
             monitor_raw.get("audio_input_name", monitor_raw.get("stall_source_name", ""))
         ).strip(),
         silence_threshold_db=float(monitor_raw.get("silence_threshold_db", -50.0)),
-        silence_seconds=int(monitor_raw.get("silence_seconds", monitor_raw.get("stall_seconds", 20))),
+        silence_seconds=int(
+            monitor_raw.get("silence_seconds", monitor_raw.get("stall_seconds", 20))
+        ),
         silence_only_when_output_active=bool(
             monitor_raw.get(
                 "silence_only_when_output_active",
@@ -493,6 +528,8 @@ def load_config(path: str) -> tuple[ObsConfig, BarkConfig, MonitorConfig]:
                 monitor_raw.get("check_interval_seconds", 5),
             )
         ),
+        meter_timeout_seconds=int(monitor_raw.get("meter_timeout_seconds", 8)),
+        startup_grace_seconds=int(monitor_raw.get("startup_grace_seconds", 5)),
     )
     return obs_cfg, bark_cfg, monitor_cfg
 
@@ -510,6 +547,7 @@ def main() -> None:
     obs_cfg, bark_cfg, monitor_cfg = load_config(args.config)
     notifier = BarkNotifier(bark_cfg)
     watcher = ObsWatchdog(obs_cfg, monitor_cfg, notifier)
+
     if args.list_sources:
         pairs = watcher.list_inputs()
         if not pairs:
