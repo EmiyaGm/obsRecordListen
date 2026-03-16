@@ -60,6 +60,8 @@ Copy-Item config.example.json config.json
 - `monitor.audio_input_name`：要监控的 OBS 音频输入名称
 - `monitor.silence_threshold_db`：静音阈值（dB，越小越安静），例如 `-50`
 - `monitor.silence_seconds`：低于阈值持续多久视为异常
+- `monitor.log_audio_volume`：是否在控制台打印当前音量（用于调试）
+- `monitor.log_audio_volume_interval_seconds`：音量打印间隔（秒）
 
 ## 4) 运行
 

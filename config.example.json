@@ -29,6 +29,8 @@
     "audio_input_name": "Mic/Aux",
     "silence_threshold_db": -50,
     "silence_seconds": 90,
-    "silence_only_when_output_active": true
+    "silence_only_when_output_active": true,
+    "log_audio_volume": false,
+    "log_audio_volume_interval_seconds": 5
   }
 }

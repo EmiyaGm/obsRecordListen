@@ -53,6 +53,8 @@ class MonitorConfig:
     silence_threshold_db: float
     silence_seconds: int
     silence_only_when_output_active: bool
+    log_audio_volume: bool
+    log_audio_volume_interval_seconds: int
 
 
 class BarkNotifier:
@@ -94,6 +96,7 @@ class ObsWatchdog:
         self.last_sound_active_ts: Optional[float] = None
         self.last_alert_ts_by_key: dict[str, float] = {}
         self.silence_alert_active = False
+        self.last_audio_log_ts: float = 0.0
 
     def _can_alert(self, key: str, now: float) -> bool:
         last = self.last_alert_ts_by_key.get(key, 0.0)
@@ -291,6 +294,7 @@ class ObsWatchdog:
         volume_db = self._get_input_volume_db()
         if volume_db is None:
             return
+        self._maybe_log_audio_volume(volume_db, now)
 
         if volume_db > self.monitor_cfg.silence_threshold_db:
             self.last_sound_active_ts = now
@@ -315,6 +319,22 @@ class ObsWatchdog:
                 ),
             )
             self.silence_alert_active = True
+
+    def _maybe_log_audio_volume(self, volume_db: float, now: float) -> None:
+        if not self.monitor_cfg.log_audio_volume:
+            return
+        interval = max(0, self.monitor_cfg.log_audio_volume_interval_seconds)
+        if interval > 0 and now - self.last_audio_log_ts < interval:
+            return
+        self.last_audio_log_ts = now
+        status = "有声" if volume_db > self.monitor_cfg.silence_threshold_db else "静音区间"
+        print(
+            "[AUDIO] "
+            f"输入='{self.monitor_cfg.audio_input_name}' "
+            f"音量={volume_db:.1f} dB "
+            f"阈值={self.monitor_cfg.silence_threshold_db:.1f} dB "
+            f"状态={status}"
+        )
 
     def run_forever(self) -> None:
         print("[INFO] OBS 监控已启动。")
@@ -395,6 +415,13 @@ def load_config(path: str) -> tuple[ObsConfig, BarkConfig, MonitorConfig]:
             monitor_raw.get(
                 "silence_only_when_output_active",
                 monitor_raw.get("stall_only_when_output_active", True),
+            )
+        ),
+        log_audio_volume=bool(monitor_raw.get("log_audio_volume", False)),
+        log_audio_volume_interval_seconds=int(
+            monitor_raw.get(
+                "log_audio_volume_interval_seconds",
+                monitor_raw.get("check_interval_seconds", 5),
             )
         ),
     )
