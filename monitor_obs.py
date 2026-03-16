@@ -5,6 +5,7 @@ import argparse
 import base64
 import hashlib
 import json
+import math
 import time
 from dataclasses import dataclass
 from typing import Optional
@@ -97,6 +98,8 @@ class ObsWatchdog:
         self.last_alert_ts_by_key: dict[str, float] = {}
         self.silence_alert_active = False
         self.last_audio_log_ts: float = 0.0
+        self.last_meter_db: Optional[float] = None
+        self.last_meter_ts: float = 0.0
 
     def _can_alert(self, key: str, now: float) -> bool:
         last = self.last_alert_ts_by_key.get(key, 0.0)
@@ -123,7 +126,11 @@ class ObsWatchdog:
             if hello.get("op") != 0:
                 raise RuntimeError(f"Unexpected OBS hello payload: {hello}")
 
-            identify = {"rpcVersion": 1}
+            identify = {
+                "rpcVersion": 1,
+                # Subscribe to all events, including high-volume meter events.
+                "eventSubscriptions": 0xFFFFFFFF,
+            }
             auth_info = (hello.get("d") or {}).get("authentication")
             if auth_info:
                 salt = auth_info["salt"]
@@ -160,6 +167,35 @@ class ObsWatchdog:
             )
             return False
 
+    def _flatten_numbers(self, value: object) -> list[float]:
+        values: list[float] = []
+        if isinstance(value, (int, float)):
+            values.append(float(value))
+            return values
+        if isinstance(value, list):
+            for item in value:
+                values.extend(self._flatten_numbers(item))
+        return values
+
+    def _handle_event(self, msg: dict) -> None:
+        data = msg.get("d") or {}
+        if data.get("eventType") != "InputVolumeMeters":
+            return
+        event_data = data.get("eventData") or {}
+        for item in event_data.get("inputs", []):
+            input_name = item.get("inputName")
+            if input_name != self.monitor_cfg.audio_input_name:
+                continue
+            db_values = self._flatten_numbers(item.get("inputLevelsDb"))
+            if not db_values:
+                continue
+            # OBS meter may include -inf when silent; choose the highest finite value.
+            finite_values = [v for v in db_values if math.isfinite(v)]
+            current_db = max(finite_values) if finite_values else -120.0
+            self.last_meter_db = current_db
+            self.last_meter_ts = time.time()
+            break
+
     def _obs_request(self, request_type: str, request_data: Optional[dict] = None) -> dict:
         if self.client is None:
             raise RuntimeError("OBS WebSocket 未连接")
@@ -180,6 +216,9 @@ class ObsWatchdog:
         while True:
             raw = self.client.recv()
             msg = json.loads(raw)
+            if msg.get("op") == 5:
+                self._handle_event(msg)
+                continue
             if msg.get("op") != 7:
                 continue
             data = msg.get("d") or {}
@@ -234,6 +273,12 @@ class ObsWatchdog:
         if self.client is None:
             return None
         try:
+            now = time.time()
+            # Prefer realtime meter data when available.
+            freshness_window = max(1, self.monitor_cfg.check_interval_seconds * 2)
+            if self.last_meter_db is not None and now - self.last_meter_ts <= freshness_window:
+                return self.last_meter_db
+
             resp = self._obs_request(
                 "GetInputVolume",
                 {
@@ -244,6 +289,10 @@ class ObsWatchdog:
             if volume_db is None:
                 print("[WARN] OBS 未返回 inputVolumeDb，跳过本次声音检测。")
                 return None
+            print(
+                "[WARN] 当前使用输入增益值而非实时电平，"
+                "请确认 OBS 版本支持 InputVolumeMeters 事件。"
+            )
             return float(volume_db)
         except ObsRequestError as exc:
             # Input name is invalid: this is config issue, not websocket disconnection.
