@@ -48,13 +48,11 @@ class MonitorConfig:
     alert_cooldown_seconds: int
     expect_recording: bool
     expect_streaming: bool
-    detect_stall: bool
-    stall_source_name: str
-    stall_image_width: int
-    stall_image_height: int
-    stall_image_quality: int
-    stall_seconds: int
-    stall_only_when_output_active: bool
+    detect_audio_silence: bool
+    audio_input_name: str
+    silence_threshold_db: float
+    silence_seconds: int
+    silence_only_when_output_active: bool
 
 
 class BarkNotifier:
@@ -93,10 +91,9 @@ class ObsWatchdog:
 
         self.client: Optional[WebSocket] = None
         self.request_id = 0
-        self.prev_screenshot_hash: Optional[str] = None
-        self.last_change_ts: Optional[float] = None
+        self.last_sound_active_ts: Optional[float] = None
         self.last_alert_ts_by_key: dict[str, float] = {}
-        self.stall_alert_active = False
+        self.silence_alert_active = False
 
     def _can_alert(self, key: str, now: float) -> bool:
         last = self.last_alert_ts_by_key.get(key, 0.0)
@@ -191,27 +188,20 @@ class ObsWatchdog:
                 raise ObsRequestError(request_type=request_type, comment=comment)
             return data.get("responseData") or {}
 
-    def list_sources(self) -> list[tuple[str, str]]:
+    def list_inputs(self) -> list[tuple[str, str]]:
         if not self._connect():
             return []
 
         all_items: list[tuple[str, str]] = []
         try:
-            scenes_resp = self._obs_request("GetSceneList")
-            scenes = scenes_resp.get("scenes", [])
-            for scene in scenes:
-                scene_name = scene.get("sceneName", "")
-                if not scene_name:
-                    continue
-                items_resp = self._obs_request(
-                    "GetSceneItemList", {"sceneName": scene_name}
-                )
-                for item in items_resp.get("sceneItems", []):
-                    source_name = item.get("sourceName", "")
-                    if source_name:
-                        all_items.append((scene_name, source_name))
+            inputs_resp = self._obs_request("GetInputList")
+            for item in inputs_resp.get("inputs", []):
+                input_name = item.get("inputName", "")
+                input_kind = item.get("inputKind", "")
+                if input_name:
+                    all_items.append((input_kind, input_name))
         except Exception as exc:
-            print(f"[WARN] 获取来源列表失败: {exc}")
+            print(f"[WARN] 获取输入列表失败: {exc}")
             return []
 
         return all_items
@@ -237,45 +227,41 @@ class ObsWatchdog:
             )
             return False, False
 
-    def _get_screenshot_hash(self) -> Optional[str]:
+    def _get_input_volume_db(self) -> Optional[float]:
         if self.client is None:
             return None
         try:
-            shot = self._obs_request(
-                "GetSourceScreenshot",
+            resp = self._obs_request(
+                "GetInputVolume",
                 {
-                    "sourceName": self.monitor_cfg.stall_source_name,
-                    "imageFormat": "jpg",
-                    "imageWidth": self.monitor_cfg.stall_image_width,
-                    "imageHeight": self.monitor_cfg.stall_image_height,
-                    "imageCompressionQuality": self.monitor_cfg.stall_image_quality,
-                },
+                    "inputName": self.monitor_cfg.audio_input_name,
+                }
             )
-            # Returns data URL like: data:image/jpg;base64,XXXX
-            image_data_url = shot.get("imageData", "")
-            b64_data = image_data_url.split(",", 1)[1] if "," in image_data_url else image_data_url
-            raw = base64.b64decode(b64_data)
-            return hashlib.sha256(raw).hexdigest()
+            volume_db = resp.get("inputVolumeDb")
+            if volume_db is None:
+                print("[WARN] OBS 未返回 inputVolumeDb，跳过本次声音检测。")
+                return None
+            return float(volume_db)
         except ObsRequestError as exc:
-            # Source name is invalid: this is config issue, not websocket disconnection.
-            if exc.request_type == "GetSourceScreenshot" and "No source was found" in exc.comment:
+            # Input name is invalid: this is config issue, not websocket disconnection.
+            if exc.request_type == "GetInputVolume" and "No input was found" in exc.comment:
                 print(
-                    f"[WARN] 截图源不存在: {self.monitor_cfg.stall_source_name}，已停用卡画面检测。"
+                    f"[WARN] 音频输入不存在: {self.monitor_cfg.audio_input_name}，已停用静音检测。"
                 )
-                self.monitor_cfg.detect_stall = False
+                self.monitor_cfg.detect_audio_silence = False
                 self._alert(
-                    "screenshot_source_missing",
-                    "截图源不存在",
+                    "audio_input_missing",
+                    "音频输入不存在",
                     (
-                        f"OBS 中未找到来源 '{self.monitor_cfg.stall_source_name}'，"
-                        "已自动停用卡画面检测。请修改 config.json 的 stall_source_name。"
+                        f"OBS 中未找到音频输入 '{self.monitor_cfg.audio_input_name}'，"
+                        "已自动停用静音检测。请修改 config.json 的 audio_input_name。"
                     ),
                 )
                 return None
-            print(f"[WARN] OBS 截图请求失败: {exc}")
+            print(f"[WARN] OBS 音量请求失败: {exc}")
             return None
         except Exception as exc:
-            print(f"[WARN] OBS 截图失败: {exc}")
+            print(f"[WARN] OBS 读取音量失败: {exc}")
             try:
                 if self.client is not None:
                     self.client.close()
@@ -283,50 +269,52 @@ class ObsWatchdog:
                 pass
             self.client = None
             self._alert(
-                "screenshot_failed",
-                "OBS 截图失败",
-                "无法截图，无法进行卡画面检测。",
+                "audio_volume_failed",
+                "OBS 音量读取失败",
+                "无法读取音频输入音量，无法进行静音检测。",
             )
             return None
 
-    def _check_stall(self, recording_active: bool, streaming_active: bool) -> None:
-        if not self.monitor_cfg.detect_stall:
+    def _check_audio_silence(self, recording_active: bool, streaming_active: bool) -> None:
+        if not self.monitor_cfg.detect_audio_silence:
             return
 
         should_check = True
-        if self.monitor_cfg.stall_only_when_output_active:
+        if self.monitor_cfg.silence_only_when_output_active:
             should_check = recording_active or streaming_active
         if not should_check:
-            self.prev_screenshot_hash = None
-            self.last_change_ts = None
-            self.stall_alert_active = False
+            self.last_sound_active_ts = None
+            self.silence_alert_active = False
             return
 
         now = time.time()
-        current_hash = self._get_screenshot_hash()
-        if not current_hash:
+        volume_db = self._get_input_volume_db()
+        if volume_db is None:
             return
 
-        if self.prev_screenshot_hash != current_hash:
-            self.prev_screenshot_hash = current_hash
-            self.last_change_ts = now
-            if self.stall_alert_active:
-                print("[INFO] 画面已恢复变化。")
-                self.stall_alert_active = False
+        if volume_db > self.monitor_cfg.silence_threshold_db:
+            self.last_sound_active_ts = now
+            if self.silence_alert_active:
+                print("[INFO] 声音已恢复。")
+                self.silence_alert_active = False
             return
 
-        if self.last_change_ts is None:
-            self.last_change_ts = now
+        if self.last_sound_active_ts is None:
+            self.last_sound_active_ts = now
             return
 
-        stalled_for = now - self.last_change_ts
-        if stalled_for >= self.monitor_cfg.stall_seconds and not self.stall_alert_active:
+        silent_for = now - self.last_sound_active_ts
+        if silent_for >= self.monitor_cfg.silence_seconds and not self.silence_alert_active:
             self._alert(
-                "video_stalled",
-                "OBS 画面可能卡住",
-                f"来源 '{self.monitor_cfg.stall_source_name}' 已连续 {int(stalled_for)} 秒无变化。",
+                "audio_silent",
+                "OBS 声音可能中断",
+                (
+                    f"音频输入 '{self.monitor_cfg.audio_input_name}' "
+                    f"音量连续 {int(silent_for)} 秒低于 "
+                    f"{self.monitor_cfg.silence_threshold_db:.1f} dB。"
+                ),
             )
-            self.stall_alert_active = True
+            self.silence_alert_active = True
 
     def run_forever(self) -> None:
         print("[INFO] OBS 监控已启动。")
@@ -347,7 +335,7 @@ class ObsWatchdog:
                         "当前未检测到推流进行中。",
                     )
 
-                self._check_stall(recording_active, streaming_active)
+                self._check_audio_silence(recording_active, streaming_active)
 
             time.sleep(self.monitor_cfg.check_interval_seconds)
 
@@ -389,7 +377,27 @@ def load_config(path: str) -> tuple[ObsConfig, BarkConfig, MonitorConfig]:
         group=bark_raw.get("group", "OBS Watchdog"),
         sound=bark_raw.get("sound", "bell"),
     )
-    monitor_cfg = MonitorConfig(**raw["monitor"])
+    monitor_raw = raw["monitor"]
+    monitor_cfg = MonitorConfig(
+        check_interval_seconds=int(monitor_raw["check_interval_seconds"]),
+        alert_cooldown_seconds=int(monitor_raw["alert_cooldown_seconds"]),
+        expect_recording=bool(monitor_raw.get("expect_recording", True)),
+        expect_streaming=bool(monitor_raw.get("expect_streaming", False)),
+        detect_audio_silence=bool(
+            monitor_raw.get("detect_audio_silence", monitor_raw.get("detect_stall", False))
+        ),
+        audio_input_name=str(
+            monitor_raw.get("audio_input_name", monitor_raw.get("stall_source_name", ""))
+        ).strip(),
+        silence_threshold_db=float(monitor_raw.get("silence_threshold_db", -50.0)),
+        silence_seconds=int(monitor_raw.get("silence_seconds", monitor_raw.get("stall_seconds", 20))),
+        silence_only_when_output_active=bool(
+            monitor_raw.get(
+                "silence_only_when_output_active",
+                monitor_raw.get("stall_only_when_output_active", True),
+            )
+        ),
+    )
     return obs_cfg, bark_cfg, monitor_cfg
 
 
@@ -399,7 +407,7 @@ def main() -> None:
     parser.add_argument(
         "--list-sources",
         action="store_true",
-        help="仅列出 OBS 场景中的所有来源名，不启动监控",
+        help="仅列出 OBS 的输入名（可用于 audio_input_name），不启动监控",
     )
     args = parser.parse_args()
 
@@ -407,17 +415,17 @@ def main() -> None:
     notifier = BarkNotifier(bark_cfg)
     watcher = ObsWatchdog(obs_cfg, monitor_cfg, notifier)
     if args.list_sources:
-        pairs = watcher.list_sources()
+        pairs = watcher.list_inputs()
         if not pairs:
-            print("[WARN] 没有读取到任何来源。请检查 OBS 是否开启、WebSocket 配置是否正确。")
+            print("[WARN] 没有读取到任何输入。请检查 OBS 是否开启、WebSocket 配置是否正确。")
             return
 
-        print("=== OBS 场景/来源列表 ===")
-        for scene_name, source_name in pairs:
-            print(f"- 场景: {scene_name} | 来源: {source_name}")
+        print("=== OBS 输入列表 ===")
+        for input_kind, input_name in pairs:
+            print(f"- 类型: {input_kind} | 输入: {input_name}")
 
         unique_sources = sorted({src for _, src in pairs})
-        print("\n=== 可用于 stall_source_name 的来源名（去重） ===")
+        print("\n=== 可用于 audio_input_name 的输入名（去重） ===")
         for source_name in unique_sources:
             print(f"- {source_name}")
         return

@@ -25,12 +25,10 @@
     "alert_cooldown_seconds": 60,
     "expect_recording": true,
     "expect_streaming": false,
-    "detect_stall": true,
-    "stall_source_name": "Program",
-    "stall_image_width": 640,
-    "stall_image_height": 360,
-    "stall_image_quality": 70,
-    "stall_seconds": 90,
-    "stall_only_when_output_active": true
+    "detect_audio_silence": true,
+    "audio_input_name": "Mic/Aux",
+    "silence_threshold_db": -50,
+    "silence_seconds": 90,
+    "silence_only_when_output_active": true
   }
 }

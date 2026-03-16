@@ -4,7 +4,7 @@ Monitor OBS recording/stream status and send Bark alerts when:
 
 - OBS disconnects (websocket unavailable)
 - recording or streaming unexpectedly stops
-- video appears stalled (same screenshot hash for too long)
+- audio appears silent for too long
 
 ## 1) Prerequisites
 
@@ -56,9 +56,10 @@ Important fields:
 - `bark.targets`: Bark target list, each item is `{ device_key, code }` and is one-to-one
 - `monitor.expect_recording`: alert if recording is not active
 - `monitor.expect_streaming`: alert if streaming is not active
-- `monitor.detect_stall`: enable frozen-frame detection
-- `monitor.stall_source_name`: source/scene name to screenshot for stall detection
-- `monitor.stall_seconds`: how long unchanged screenshot is considered stalled
+- `monitor.detect_audio_silence`: enable silence detection
+- `monitor.audio_input_name`: OBS audio input name to monitor
+- `monitor.silence_threshold_db`: dB threshold (lower means quieter), e.g. `-50`
+- `monitor.silence_seconds`: how long below threshold is considered abnormal
 
 ## 4) Run
 
@@ -76,6 +77,6 @@ Keep this process running in background (tmux/systemd/launchd are recommended).
 
 ## 5) Notes
 
-- Stall detection is hash-based screenshot comparison; fully static scenes can trigger false positives.
-- If your content is naturally static, increase `stall_seconds` or disable `detect_stall`.
+- Silence detection is based on OBS input volume (`GetInputVolume`).
+- Adjust `silence_threshold_db` and `silence_seconds` to reduce false positives.
 - Alerts use cooldown (`monitor.alert_cooldown_seconds`) to avoid spam.
