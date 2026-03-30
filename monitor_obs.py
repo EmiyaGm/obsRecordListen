@@ -143,6 +143,11 @@ class ObsWatchdog:
             print(f"[ALERT] {title} - {body}")
             self.notifier.send(title, body)
 
+    def _notify_no_cooldown(self, title: str, body: str) -> None:
+        """立即推送（不受 alert_cooldown_seconds 限制）。"""
+        print(f"[ALERT] {title} - {body}")
+        self.notifier.send(title, body)
+
     def _disconnect_client(self) -> None:
         try:
             if self.client is not None:
@@ -468,6 +473,14 @@ class ObsWatchdog:
             self.last_sound_active_ts = now
             if self.silence_alert_active:
                 print("[INFO] 声音已恢复。")
+                self._notify_no_cooldown(
+                    "OBS 声音已恢复",
+                    (
+                        f"音频输入 '{self.monitor_cfg.audio_input_name}' "
+                        f"音量已恢复至 {volume_db:.1f} dB（阈值 "
+                        f"{self.monitor_cfg.silence_threshold_db:.1f} dB）。"
+                    ),
+                )
                 self.silence_alert_active = False
             return
 
