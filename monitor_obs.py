@@ -6,6 +6,7 @@ import base64
 import hashlib
 import json
 import math
+import sys
 import time
 from dataclasses import dataclass
 from typing import Optional
@@ -58,6 +59,10 @@ class MonitorConfig:
     log_audio_volume_interval_seconds: int
     meter_timeout_seconds: int
     startup_grace_seconds: int
+    # 录制/推流均停止且仅在输出活跃时检测静音时：停止后过 N 秒再采一次电平并 Bark 告知（0=关闭）
+    audio_recheck_after_output_stop_seconds: int
+    # 曾在录制中变为未录制后，满 N 秒则退出进程（0=不退出）
+    exit_after_record_stop_seconds: int
 
 
 class BarkNotifier:
@@ -108,6 +113,14 @@ class ObsWatchdog:
         self.connected_ts: float = 0.0
         self.meter_parse_warned = False
         self.meter_name_hint_warned = False
+
+        self._last_outputs_active: bool = False
+        self._had_output_active_session: bool = False
+        self._output_inactive_since: Optional[float] = None
+        self._output_stop_recheck_sent: bool = False
+
+        self._prev_recording_active: bool = False
+        self._record_inactive_since: Optional[float] = None
 
     def _reset_runtime_audio_state(self) -> None:
         self.last_sound_active_ts = None
@@ -177,6 +190,12 @@ class ObsWatchdog:
             self.client = ws
             self.connected_ts = time.time()
             self._reset_runtime_audio_state()
+            self._last_outputs_active = False
+            self._had_output_active_session = False
+            self._output_inactive_since = None
+            self._output_stop_recheck_sent = False
+            self._prev_recording_active = False
+            self._record_inactive_since = None
             print("[INFO] 已连接 OBS WebSocket。")
             return True
         except Exception as exc:
@@ -359,13 +378,76 @@ class ObsWatchdog:
 
         return None
 
+    def _sample_input_volume_db_quiet(self) -> tuple[Optional[float], str]:
+        """拉取当前电平用于汇报，不触发「电平不可用」类告警。"""
+        now = time.time()
+        self._pump_events()
+        if now - self.connected_ts < self.monitor_cfg.startup_grace_seconds:
+            return None, "连接后仍在启动宽限期内，未采样"
+        if (
+            self.last_meter_db is not None
+            and now - self.last_meter_ts <= self.monitor_cfg.meter_timeout_seconds
+        ):
+            return self.last_meter_db, "已收到实时电平"
+        return (
+            None,
+            f"已超过 {self.monitor_cfg.meter_timeout_seconds} 秒未收到该输入的电平更新",
+        )
+
     def _check_audio_silence(self, recording_active: bool, streaming_active: bool) -> None:
         if not self.monitor_cfg.detect_audio_silence:
             return
 
+        outputs_active = recording_active or streaming_active
+        prev_outputs_active = self._last_outputs_active
+        now = time.time()
+
+        recheck_sec = self.monitor_cfg.audio_recheck_after_output_stop_seconds
+        if (
+            recheck_sec > 0
+            and self.monitor_cfg.silence_only_when_output_active
+            and self.client is not None
+        ):
+            if outputs_active:
+                self._had_output_active_session = True
+                self._output_inactive_since = None
+                self._output_stop_recheck_sent = False
+            else:
+                if prev_outputs_active:
+                    self._output_inactive_since = now
+                    self._output_stop_recheck_sent = False
+                if (
+                    self._had_output_active_session
+                    and self._output_inactive_since is not None
+                    and not self._output_stop_recheck_sent
+                    and now - self._output_inactive_since >= recheck_sec
+                ):
+                    db, detail = self._sample_input_volume_db_quiet()
+                    if db is not None:
+                        loud = db > self.monitor_cfg.silence_threshold_db
+                        body = (
+                            f"输入「{self.monitor_cfg.audio_input_name}」停止输出约 "
+                            f"{int(now - self._output_inactive_since)} 秒后复查："
+                            f"{db:.1f} dB（阈值 {self.monitor_cfg.silence_threshold_db:.1f} dB），"
+                            f"判定为{'有声' if loud else '低于阈值/静音区间'}。{detail}"
+                        )
+                    else:
+                        body = (
+                            f"输入「{self.monitor_cfg.audio_input_name}」停止输出约 "
+                            f"{int(now - self._output_inactive_since)} 秒后复查：{detail}。"
+                        )
+                    self._alert(
+                        "audio_stop_recheck",
+                        "录制/推流停止后音频复查",
+                        body,
+                    )
+                    self._output_stop_recheck_sent = True
+
+        self._last_outputs_active = outputs_active
+
         should_check = True
         if self.monitor_cfg.silence_only_when_output_active:
-            should_check = recording_active or streaming_active
+            should_check = outputs_active
 
         if not should_check:
             self.last_sound_active_ts = None
@@ -443,6 +525,21 @@ class ObsWatchdog:
             if self._connect():
                 recording_active, streaming_active = self._check_output_status()
 
+                exit_sec = self.monitor_cfg.exit_after_record_stop_seconds
+                if exit_sec > 0:
+                    now = time.time()
+                    if recording_active:
+                        self._record_inactive_since = None
+                    elif self._prev_recording_active:
+                        self._record_inactive_since = now
+                    if self._record_inactive_since is not None:
+                        if now - self._record_inactive_since >= exit_sec:
+                            print(
+                                f"[INFO] 录制已停止超过 {exit_sec} 秒，退出程序。"
+                            )
+                            self._disconnect_client()
+                            sys.exit(0)
+
                 if self.monitor_cfg.expect_recording and not recording_active:
                     self._alert(
                         "record_stopped",
@@ -458,6 +555,8 @@ class ObsWatchdog:
                     )
 
                 self._check_audio_silence(recording_active, streaming_active)
+
+                self._prev_recording_active = recording_active
 
             time.sleep(self.monitor_cfg.check_interval_seconds)
 
@@ -530,6 +629,12 @@ def load_config(path: str) -> tuple[ObsConfig, BarkConfig, MonitorConfig]:
         ),
         meter_timeout_seconds=int(monitor_raw.get("meter_timeout_seconds", 8)),
         startup_grace_seconds=int(monitor_raw.get("startup_grace_seconds", 5)),
+        audio_recheck_after_output_stop_seconds=int(
+            monitor_raw.get("audio_recheck_after_output_stop_seconds", 0)
+        ),
+        exit_after_record_stop_seconds=int(
+            monitor_raw.get("exit_after_record_stop_seconds", 0)
+        ),
     )
     return obs_cfg, bark_cfg, monitor_cfg
 

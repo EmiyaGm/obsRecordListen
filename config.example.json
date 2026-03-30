@@ -30,6 +30,8 @@
     "silence_threshold_db": -50,
     "silence_seconds": 90,
     "silence_only_when_output_active": true,
+    "audio_recheck_after_output_stop_seconds": 30,
+    "exit_after_record_stop_seconds": 0,
     "log_audio_volume": false,
     "log_audio_volume_interval_seconds": 5
   }
