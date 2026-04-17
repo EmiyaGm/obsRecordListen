@@ -8,6 +8,7 @@ import json
 import math
 import sys
 import time
+import threading
 from dataclasses import dataclass
 from typing import Optional
 
@@ -532,9 +533,13 @@ class ObsWatchdog:
             f"状态={status}"
         )
 
-    def run_forever(self) -> None:
+    def run_forever(self, stop_event: Optional[threading.Event] = None) -> None:
         print("[INFO] OBS 监控已启动。")
         while True:
+            if stop_event is not None and stop_event.is_set():
+                print("[INFO] 收到停止信号，监控即将退出。")
+                self._disconnect_client()
+                return
             if self._connect():
                 recording_active, streaming_active = self._check_output_status()
 
@@ -571,7 +576,15 @@ class ObsWatchdog:
 
                 self._prev_recording_active = recording_active
 
-            time.sleep(self.monitor_cfg.check_interval_seconds)
+            interval = max(0, int(self.monitor_cfg.check_interval_seconds))
+            if stop_event is None or interval == 0:
+                time.sleep(interval)
+                continue
+            # Use interruptible sleep so GUI stop requests can be handled quickly.
+            if stop_event.wait(timeout=interval):
+                print("[INFO] 收到停止信号，监控即将退出。")
+                self._disconnect_client()
+                return
 
 
 def load_config(path: str) -> tuple[ObsConfig, BarkConfig, MonitorConfig]:
