@@ -1,2 +1,4 @@
 requests
 websocket-client
+PySide6
+pyinstaller
