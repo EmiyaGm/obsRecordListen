@@ -34,7 +34,17 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from monitor_obs import BarkConfig, BarkTarget, MonitorConfig, ObsConfig, ObsWatchdog, BarkNotifier, load_config
+from monitor_obs import (
+    AlertNotifier,
+    BarkConfig,
+    BarkTarget,
+    MonitorConfig,
+    NtfyConfig,
+    NtfyTarget,
+    ObsConfig,
+    ObsWatchdog,
+    load_config,
+)
 
 
 class QueueWriter:
@@ -83,6 +93,7 @@ class MainWindow(QMainWindow):
 
         config_layout.addWidget(self._build_obs_group())
         config_layout.addWidget(self._build_bark_group())
+        config_layout.addWidget(self._build_ntfy_group())
         config_layout.addWidget(self._build_monitor_group())
         config_layout.addLayout(self._build_action_row())
         config_layout.addStretch(1)
@@ -162,6 +173,46 @@ class MainWindow(QMainWindow):
         btn_del = QPushButton("删除选中行")
         btn_add.clicked.connect(self.add_target_row)
         btn_del.clicked.connect(self.delete_selected_target_rows)
+        row.addWidget(btn_add)
+        row.addWidget(btn_del)
+        row.addStretch(1)
+        layout.addLayout(row)
+
+        return group
+
+    def _build_ntfy_group(self) -> QGroupBox:
+        group = QGroupBox("ntfy 推送设置（适合 Android）")
+        layout = QVBoxLayout(group)
+        form = QFormLayout()
+
+        self.ntfy_server = QLineEdit()
+        self.ntfy_priority = QSpinBox()
+        self.ntfy_priority.setRange(1, 5)
+        self.ntfy_tags = QLineEdit()
+
+        self.ntfy_server.setToolTip("ntfy 服务地址，默认 https://ntfy.sh，也可填自建服务器")
+        self.ntfy_priority.setToolTip("通知优先级：1 最低，3 默认，4 高，5 紧急")
+        self.ntfy_tags.setToolTip("通知标签，逗号分隔，例如 warning,obs")
+
+        form.addRow(self._label_with_desc("服务地址", "ntfy 服务端 URL"), self.ntfy_server)
+        form.addRow(self._label_with_desc("优先级", "1-5，数值越大越醒目"), self.ntfy_priority)
+        form.addRow(self._label_with_desc("标签", "逗号分隔的标签或 emoji"), self.ntfy_tags)
+        layout.addLayout(form)
+
+        layout.addWidget(QLabel("订阅主题列表（每行一个 topic，可选填访问令牌）"))
+        self.ntfy_targets_table = QTableWidget(0, 2)
+        self.ntfy_targets_table.setHorizontalHeaderLabels(["主题（topic）", "访问令牌（token，可选）"])
+        self.ntfy_targets_table.setToolTip(
+            "在 ntfy App 中订阅相同 topic 即可收到推送；私有主题需填写 token"
+        )
+        self.ntfy_targets_table.horizontalHeader().setStretchLastSection(True)
+        layout.addWidget(self.ntfy_targets_table)
+
+        row = QHBoxLayout()
+        btn_add = QPushButton("新增主题")
+        btn_del = QPushButton("删除选中行")
+        btn_add.clicked.connect(self.add_ntfy_target_row)
+        btn_del.clicked.connect(self.delete_selected_ntfy_target_rows)
         row.addWidget(btn_add)
         row.addWidget(btn_del)
         row.addStretch(1)
@@ -281,6 +332,20 @@ class MainWindow(QMainWindow):
         for row in selected_rows:
             self.targets_table.removeRow(row)
 
+    def add_ntfy_target_row(self, topic: str = "", token: str = "") -> None:
+        row = self.ntfy_targets_table.rowCount()
+        self.ntfy_targets_table.insertRow(row)
+        self.ntfy_targets_table.setItem(row, 0, QTableWidgetItem(topic))
+        self.ntfy_targets_table.setItem(row, 1, QTableWidgetItem(token))
+
+    def delete_selected_ntfy_target_rows(self) -> None:
+        selected_rows = sorted(
+            {item.row() for item in self.ntfy_targets_table.selectedItems()},
+            reverse=True,
+        )
+        for row in selected_rows:
+            self.ntfy_targets_table.removeRow(row)
+
     def load_config_from_file(self) -> None:
         path_text = self.config_path_input.text().strip() or "config.json"
         self.config_path = Path(path_text)
@@ -288,13 +353,14 @@ class MainWindow(QMainWindow):
             self.append_log(f"[INFO] 配置文件不存在，将使用当前界面值：{self.config_path}")
             return
         try:
-            obs_cfg, bark_cfg, monitor_cfg = load_config(str(self.config_path))
+            obs_cfg, bark_cfg, ntfy_cfg, monitor_cfg = load_config(str(self.config_path))
         except Exception as exc:
             QMessageBox.critical(self, "加载失败", f"读取配置失败：{exc}")
             return
 
         self.set_obs_form(obs_cfg)
         self.set_bark_form(bark_cfg)
+        self.set_ntfy_form(ntfy_cfg)
         self.set_monitor_form(monitor_cfg)
         self.append_log(f"[INFO] 已加载配置：{self.config_path}")
 
@@ -327,6 +393,14 @@ class MainWindow(QMainWindow):
         for target in cfg.targets:
             self.add_target_row(target.device_key, target.code)
 
+    def set_ntfy_form(self, cfg: NtfyConfig) -> None:
+        self.ntfy_server.setText(cfg.server)
+        self.ntfy_priority.setValue(cfg.priority)
+        self.ntfy_tags.setText(",".join(cfg.tags))
+        self.ntfy_targets_table.setRowCount(0)
+        for target in cfg.targets:
+            self.add_ntfy_target_row(target.topic, target.token)
+
     def set_monitor_form(self, cfg: MonitorConfig) -> None:
         self.check_interval_seconds.setValue(cfg.check_interval_seconds)
         self.alert_cooldown_seconds.setValue(cfg.alert_cooldown_seconds)
@@ -344,7 +418,7 @@ class MainWindow(QMainWindow):
         self.audio_recheck_after_output_stop_seconds.setValue(cfg.audio_recheck_after_output_stop_seconds)
         self.exit_after_record_stop_seconds.setValue(cfg.exit_after_record_stop_seconds)
 
-    def build_config_objects(self) -> tuple[ObsConfig, BarkConfig, MonitorConfig]:
+    def build_config_objects(self) -> tuple[ObsConfig, BarkConfig, NtfyConfig, MonitorConfig]:
         obs_cfg = ObsConfig(
             host=self.obs_host.text().strip(),
             port=int(self.obs_port.value()),
@@ -367,6 +441,23 @@ class MainWindow(QMainWindow):
             sound=self.bark_sound.text().strip() or "bell",
         )
 
+        ntfy_targets: list[NtfyTarget] = []
+        for row in range(self.ntfy_targets_table.rowCount()):
+            topic_item = self.ntfy_targets_table.item(row, 0)
+            token_item = self.ntfy_targets_table.item(row, 1)
+            topic = (topic_item.text() if topic_item else "").strip()
+            token = (token_item.text() if token_item else "").strip()
+            if topic:
+                ntfy_targets.append(NtfyTarget(topic=topic, token=token))
+
+        tags = [t.strip() for t in self.ntfy_tags.text().split(",") if t.strip()]
+        ntfy_cfg = NtfyConfig(
+            server=self.ntfy_server.text().strip() or "https://ntfy.sh",
+            targets=ntfy_targets,
+            priority=int(self.ntfy_priority.value()),
+            tags=tags or ["warning", "obs"],
+        )
+
         monitor_cfg = MonitorConfig(
             check_interval_seconds=int(self.check_interval_seconds.value()),
             alert_cooldown_seconds=int(self.alert_cooldown_seconds.value()),
@@ -386,10 +477,10 @@ class MainWindow(QMainWindow):
             ),
             exit_after_record_stop_seconds=int(self.exit_after_record_stop_seconds.value()),
         )
-        return obs_cfg, bark_cfg, monitor_cfg
+        return obs_cfg, bark_cfg, ntfy_cfg, monitor_cfg
 
     def build_raw_config(self) -> dict[str, Any]:
-        obs_cfg, bark_cfg, monitor_cfg = self.build_config_objects()
+        obs_cfg, bark_cfg, ntfy_cfg, monitor_cfg = self.build_config_objects()
         return {
             "obs": asdict(obs_cfg),
             "bark": {
@@ -397,6 +488,12 @@ class MainWindow(QMainWindow):
                 "targets": [asdict(t) for t in bark_cfg.targets],
                 "group": bark_cfg.group,
                 "sound": bark_cfg.sound,
+            },
+            "ntfy": {
+                "server": ntfy_cfg.server,
+                "targets": [asdict(t) for t in ntfy_cfg.targets],
+                "priority": ntfy_cfg.priority,
+                "tags": ntfy_cfg.tags,
             },
             "monitor": asdict(monitor_cfg),
         }
@@ -407,13 +504,13 @@ class MainWindow(QMainWindow):
             return
 
         self.save_config_to_file()
-        obs_cfg, bark_cfg, monitor_cfg = self.build_config_objects()
+        obs_cfg, bark_cfg, ntfy_cfg, monitor_cfg = self.build_config_objects()
 
         self.stop_event = threading.Event()
 
         def worker() -> None:
             writer = QueueWriter(self.log_queue)
-            notifier = BarkNotifier(bark_cfg)
+            notifier = AlertNotifier(bark_cfg, ntfy_cfg)
             watcher = ObsWatchdog(obs_cfg, monitor_cfg, notifier)
             with redirect_stdout(writer), redirect_stderr(writer):
                 try:

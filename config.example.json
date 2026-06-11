@@ -20,6 +20,17 @@
     "group": "OBS Watchdog",
     "sound": "bell"
   },
+  "ntfy": {
+    "server": "https://ntfy.sh",
+    "targets": [
+      {
+        "topic": "your_secret_topic_name",
+        "token": ""
+      }
+    ],
+    "priority": 4,
+    "tags": ["warning", "obs"]
+  },
   "monitor": {
     "check_interval_seconds": 5,
     "alert_cooldown_seconds": 60,

@@ -38,6 +38,20 @@ class BarkConfig:
 
 
 @dataclass
+class NtfyTarget:
+    topic: str
+    token: str = ""
+
+
+@dataclass
+class NtfyConfig:
+    server: str
+    targets: list[NtfyTarget]
+    priority: int
+    tags: list[str]
+
+
+@dataclass
 class ObsConfig:
     host: str
     port: int
@@ -72,7 +86,6 @@ class BarkNotifier:
 
     def send(self, title: str, body: str) -> None:
         if not self.cfg.targets:
-            print("[WARN] 未配置 Bark targets，已跳过推送。")
             return
 
         for target in self.cfg.targets:
@@ -94,8 +107,52 @@ class BarkNotifier:
                 )
 
 
+class NtfyNotifier:
+    def __init__(self, cfg: NtfyConfig):
+        self.cfg = cfg
+
+    def send(self, title: str, body: str) -> None:
+        if not self.cfg.targets:
+            return
+
+        for target in self.cfg.targets:
+            url = f"{self.cfg.server.rstrip('/')}/{target.topic}"
+            headers: dict[str, str] = {"Title": title}
+            if self.cfg.tags:
+                headers["Tags"] = ",".join(self.cfg.tags)
+            if self.cfg.priority:
+                headers["Priority"] = str(self.cfg.priority)
+            if target.token:
+                headers["Authorization"] = f"Bearer {target.token}"
+
+            try:
+                resp = requests.post(
+                    url,
+                    data=body.encode("utf-8"),
+                    headers=headers,
+                    timeout=5,
+                )
+                resp.raise_for_status()
+            except Exception as exc:
+                topic_preview = target.topic[:12] + "..." if len(target.topic) > 12 else target.topic
+                print(f"[WARN] ntfy 推送失败（topic={topic_preview}）: {exc}")
+
+
+class AlertNotifier:
+    def __init__(self, bark_cfg: BarkConfig, ntfy_cfg: NtfyConfig):
+        self.bark = BarkNotifier(bark_cfg)
+        self.ntfy = NtfyNotifier(ntfy_cfg)
+
+    def send(self, title: str, body: str) -> None:
+        if not self.bark.cfg.targets and not self.ntfy.cfg.targets:
+            print("[WARN] 未配置任何推送目标（Bark / ntfy），已跳过推送。")
+            return
+        self.bark.send(title, body)
+        self.ntfy.send(title, body)
+
+
 class ObsWatchdog:
-    def __init__(self, obs_cfg: ObsConfig, monitor_cfg: MonitorConfig, notifier: BarkNotifier):
+    def __init__(self, obs_cfg: ObsConfig, monitor_cfg: MonitorConfig, notifier: AlertNotifier):
         self.obs_cfg = obs_cfg
         self.monitor_cfg = monitor_cfg
         self.notifier = notifier
@@ -587,7 +644,45 @@ class ObsWatchdog:
                 return
 
 
-def load_config(path: str) -> tuple[ObsConfig, BarkConfig, MonitorConfig]:
+def _load_ntfy_config(raw: dict) -> NtfyConfig:
+    ntfy_raw = dict(raw.get("ntfy") or {})
+    targets: list[NtfyTarget] = []
+
+    for item in ntfy_raw.get("targets", []) or []:
+        topic = str(item.get("topic", "")).strip()
+        token = str(item.get("token", "")).strip()
+        if topic:
+            targets.append(NtfyTarget(topic=topic, token=token))
+
+    if not targets:
+        for topic in ntfy_raw.get("topics", []) or []:
+            t = str(topic).strip()
+            if t:
+                targets.append(NtfyTarget(topic=t))
+
+    legacy_topic = str(ntfy_raw.get("topic", "")).strip()
+    if not targets and legacy_topic:
+        targets.append(NtfyTarget(topic=legacy_topic, token=str(ntfy_raw.get("token", "")).strip()))
+
+    priority_raw = ntfy_raw.get("priority", 4)
+    priority_map = {"min": 1, "low": 2, "default": 3, "high": 4, "max": 5, "urgent": 5}
+    if isinstance(priority_raw, str):
+        priority = priority_map.get(priority_raw.strip().lower(), 4)
+    else:
+        priority = int(priority_raw)
+
+    tags_raw = ntfy_raw.get("tags", ["warning", "obs"]) or []
+    tags = [str(t).strip() for t in tags_raw if str(t).strip()]
+
+    return NtfyConfig(
+        server=str(ntfy_raw.get("server", "https://ntfy.sh")).strip() or "https://ntfy.sh",
+        targets=targets,
+        priority=max(1, min(5, priority)),
+        tags=tags,
+    )
+
+
+def load_config(path: str) -> tuple[ObsConfig, BarkConfig, NtfyConfig, MonitorConfig]:
     with open(path, "r", encoding="utf-8") as f:
         raw = json.load(f)
 
@@ -662,11 +757,12 @@ def load_config(path: str) -> tuple[ObsConfig, BarkConfig, MonitorConfig]:
             monitor_raw.get("exit_after_record_stop_seconds", 0)
         ),
     )
-    return obs_cfg, bark_cfg, monitor_cfg
+    ntfy_cfg = _load_ntfy_config(raw)
+    return obs_cfg, bark_cfg, ntfy_cfg, monitor_cfg
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="OBS 监控并通过 Bark 告警")
+    parser = argparse.ArgumentParser(description="OBS 监控并通过 Bark / ntfy 告警")
     parser.add_argument("--config", default="config.json", help="配置文件路径（JSON）")
     parser.add_argument(
         "--list-sources",
@@ -675,8 +771,8 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    obs_cfg, bark_cfg, monitor_cfg = load_config(args.config)
-    notifier = BarkNotifier(bark_cfg)
+    obs_cfg, bark_cfg, ntfy_cfg, monitor_cfg = load_config(args.config)
+    notifier = AlertNotifier(bark_cfg, ntfy_cfg)
     watcher = ObsWatchdog(obs_cfg, monitor_cfg, notifier)
 
     if args.list_sources:
