@@ -116,19 +116,26 @@ class NtfyNotifier:
             return
 
         for target in self.cfg.targets:
-            url = f"{self.cfg.server.rstrip('/')}/{target.topic}"
-            headers: dict[str, str] = {"Title": title}
+            # JSON 发布（POST 到根 URL），避免 Title/Tags 等 HTTP 头只能 latin-1 导致中文失败
+            url = f"{self.cfg.server.rstrip('/')}/"
+            payload: dict[str, object] = {
+                "topic": target.topic,
+                "title": title,
+                "message": body,
+            }
             if self.cfg.tags:
-                headers["Tags"] = ",".join(self.cfg.tags)
+                payload["tags"] = self.cfg.tags
             if self.cfg.priority:
-                headers["Priority"] = str(self.cfg.priority)
+                payload["priority"] = self.cfg.priority
+
+            headers: dict[str, str] = {}
             if target.token:
                 headers["Authorization"] = f"Bearer {target.token}"
 
             try:
                 resp = requests.post(
                     url,
-                    data=body.encode("utf-8"),
+                    json=payload,
                     headers=headers,
                     timeout=5,
                 )
